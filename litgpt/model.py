@@ -453,7 +453,7 @@ class LLaMAMLP(nn.Module):
 
 
 class whisperMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config) -> None:
         super().__init__()
         self.fc_1 = nn.Linear(config.whisper_adapter_dim, config.intermediate_size, bias=config.bias)
         self.fc_2 = nn.Linear(config.whisper_adapter_dim, config.intermediate_size, bias=config.bias)
@@ -461,12 +461,33 @@ class whisperMLP(nn.Module):
 
         self.config = config
 
+        # Pooling layer for dimensionality reduction (if necessary)
+        self.pooling = nn.AdaptiveAvgPool1d(768)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        device = x.device
+
+        # Handle MPS-specific operations
+        if device.type == 'mps':
+            # Move the tensor to CPU if necessary (for unsupported ops)
+            x = x.to('cpu')
+
+            # Reshape the tensor for pooling
+            x = x.view(x.size(0), -1)  # Flatten dimensions except the batch size
+            x = x.unsqueeze(1)  # Add a channel dimension for pooling
+            x = self.pooling(x).squeeze(1)  # Apply pooling and remove the channel dimension after pooling
+
+        # Make sure the tensor is back on MPS if available
+        if device.type == 'mps':
+            x = x.to('mps')
+
+        # Perform the standard operations
         x_fc_1 = self.fc_1(x)
         x_fc_2 = self.fc_2(x)
         x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        return self.proj(x)
 
+        # Final projection
+        return self.proj(x)
 
 class GemmaMLP(LLaMAMLP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -562,16 +583,31 @@ class KVCache(nn.Module):
             "v", torch.zeros(v_shape, device=device, dtype=dtype), persistent=False
         )
 
-    def forward(
-        self, input_pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # move the buffer to the activation dtype for when AMP is used
-        self.k = self.k.to(k.dtype)
-        self.v = self.v.to(v.dtype)
-        # update the cache
-        k = self.k.index_copy_(2, input_pos, k)
-        v = self.v.index_copy_(2, input_pos, v)
-        return k, v
+    def forward(self, input_pos: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if input_pos.is_mps:
+            input_pos = input_pos.cpu()
+            k = k.cpu()
+            v = v.cpu()
+            self.k = self.k.cpu()  # Move self.k to CPU as well
+            self.v = self.v.cpu()  # Move self.v to CPU as well
+            self.k = self.k.index_copy_(2, input_pos, k)
+            self.v = self.v.index_copy_(2, input_pos, v)
+
+            # Move tensors back to MPS if available
+            if torch.backends.mps.is_available():
+                self.k = self.k.to('mps')
+                self.v = self.v.to('mps')
+
+            return self.k, self.v
+        else:
+            # move the buffer to the activation dtype for when AMP is used
+            self.k = self.k.to(k.dtype)
+            self.v = self.v.to(v.dtype)
+            # update the cache
+            k = self.k.index_copy_(2, input_pos, k)
+            v = self.v.index_copy_(2, input_pos, v)
+            return k, v
+
 
     def reset_parameters(self) -> None:
         torch.nn.init.zeros_(self.k)
